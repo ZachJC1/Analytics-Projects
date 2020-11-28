@@ -1,0 +1,1318 @@
+---
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+# Analysis of NYT Comments and Article Snippets {.tabset}
+
+```{r setup, include = FALSE}
+# Load necessary packages
+library(dplyr)
+library(tidyverse)
+library(parallel)
+library(doParallel)
+library(data.table)
+library(quanteda)
+library(janitor)
+library(pander)
+library(pROC)
+
+knitr::opts_knit$set(root.dir = "C:/Users/rdh8eg.MCINTIRE.000/Downloads/nyt-comments/")
+
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, error = FALSE, warning = FALSE)
+```
+
+## Data Cleaning
+
+The code below takes data in a directory called *nyt-comments* and reads in a random sample of 200 articles. To ensure consistency in our samples, we reset the seed at the beginning of both chunks. While the processes performed by each vary slightly, they both perform the same general procedure:
+
+1. Change working directory to *nyt-comments*
+2. Create a variable with the name of the directory for the cleaned data
+3. Offer the user the option to delete any files in the working directory not included in the original download
+4. Loop through each of the files:
+  * Read in $n$ Articles from each month
+  * Join with appropriate comments
+  * Perform cleaning procedures
+  * Save as dataframe
+5. Create a new directory for the file, change working directory
+6. Write the files to the new directory
+7. Clear the workspace
+
+```{r CleanNGramData, eval = FALSE}
+library(stringr)
+library(tm)
+
+seed <- 4559 
+# Link to data used in analysis: https://www.kaggle.com/aashita/nyt-comments
+
+# Where to write cleaned files
+setwd("C:/Users/rdh8eg.MCINTIRE.000/Downloads/nyt-comments/")
+loc <- paste(getwd(), "/ngrams_Data_Clean/", sep = "")
+
+# Number of articles to sample per month
+n <- 200
+
+# Set seed for reproducibility. Important becasue start the project with sampling
+set.seed(seed)
+
+
+# Get names of all relevant files in the working directory, classify
+articles <- list.files(pattern = "^Articles")
+comments <- list.files(pattern = "^Comments")
+
+# Delete any file in the directory that is not one of the original files
+
+if(readline("Do you want to delete additional files (Y/N)?: ") == "Y"){
+  if(dir.exists(loc)){
+  setwd(loc)
+  file.remove(list.files())
+  setwd("../")
+  file.remove(loc, recursive = TRUE)
+  }
+
+  del <- list.files()
+  del <- del[-which(del %in% c(comments, articles, "Sentiment_Data_Clean"))]
+
+  file.remove(del)
+}
+
+
+# set up parallel processing for faster processing
+try(stopCluster(cl), silent = TRUE) # stop parallel interface if started/running
+message(paste("Cores detected:", detectCores(logical = FALSE)))
+cl <- makePSOCKcluster(detectCores(logical = FALSE))
+registerDoParallel(cl) # initialize new parallel interface
+
+
+# Read in articles  with sample size n, join with related comments file
+for(i in articles){
+     t.pos <- unlist(str_locate(i, "\\."))
+     
+     t.nam <- substring(i, 0, t.pos[1] - 1)
+     
+     assign(t.nam, sample_n(fread(i), n))
+
+     t.dpos <- unlist(str_locate(i, "s[A-Z]"))
+     t.date <- substring(i, t.dpos[2])
+     t.com <- comments[grep(t.date, comments)]
+     t.com <- fread(t.com)
+     
+     assign(t.nam, get(t.nam) %>% 
+          left_join(t.com))
+}
+
+rm(list = ls(pattern = "^t\\."))
+
+
+data <- ls(pattern = "^[A-Z]")
+
+
+# Preliminary cleaning of all relevant fields
+for(i in data){
+     t.temp <- get(i)
+     
+     # Drop non Article Categories
+     t.temp <- t.temp %>% 
+          filter(!newDesk == "Games") %>% 
+          select(-picURL, -webURL, -commentTitle,
+                 -userDisplayName, -userLocation,
+                 -userTitle, -userURL, -permID,
+                 -parentUserDisplayName) 
+     
+     # Transform character variables, doesn't work w/o controlling for missing abstract
+     if(length(t.temp) == 35){
+          t.temp <- t.temp %>% 
+               mutate(snippet = as.character(snippet),
+                      headline = as.character(headline),
+                      byline = as.character(byline),
+                      abstract = as.character(abstract),
+                      keywords = as.character(keywords),
+                      pubDate = as_date(pubDate),
+                      approveDate = as_date(approveDate),
+                      commentBody = as.character(commentBody),
+                      createDate = as_date(createDate),
+                      updateDate = as_date(updateDate))
+     }
+     else{
+          t.temp <- t.temp %>% 
+               mutate(snippet = as.character(snippet),
+                      headline = as.character(headline),
+                      byline = as.character(byline),
+                      keywords = as.character(keywords),
+                      pubDate = as_date(pubDate),
+                      approveDate = as_date(approveDate),
+                      commentBody = as.character(commentBody),
+                      createDate = as_date(createDate),
+                      updateDate = as_date(updateDate))
+     }
+
+     
+     # commentBody cleaning
+     ## Words/acronyms that we wish to protect
+     t.temp$commentBody <- gsub("(u\\.s\\.)", "unitedstates", t.temp$commentBody, ignore.case = TRUE)
+     t.temp$commentBody <- gsub("(u\\.s\\.a\\.)", "unitedstates", t.temp$commentBody, ignore.case = TRUE)
+     t.temp$commentBody <- gsub("US", "unitedstates", t.temp$commentBody, ignore.case = FALSE)
+     t.temp$commentBody <- gsub("USA", "unitedstates", t.temp$commentBody, ignore.case = FALSE)
+     
+     t.temp$commentBody <- gsub("(u\\.k\\.)", "unitedkingdom", t.temp$commentBody, ignore.case = TRUE)
+     t.temp$commentBody <- gsub("UK", "unitedkingdom", t.temp$commentBody, ignore.case = FALSE)
+     
+     ## Replace certain punctuation with word representations
+     t.temp$commentBody <- gsub("$", "dollarSign", t.temp$commentBody, fixed = TRUE)
+     t.temp$commentBody <- gsub("@", "atSign", t.temp$commentBody)
+     t.temp$commentBody <- gsub("\\.", " ", t.temp$commentBody)
+     t.temp$commentBody <- gsub("'", "", t.temp$commentBody)
+     t.temp$commentBody <- gsub("-", "", t.temp$commentBody)
+     t.temp$commentBody <- gsub("<br>", "", t.temp$commentBody)
+     
+     
+     ## Remove the rest of the punctuation and fix whitespace
+     t.temp$commentBody <- gsub("[[:punct:]]", " ", t.temp$commentBody)
+     t.temp$commentBody <- trimws(stripWhitespace(t.temp$commentBody))
+     
+                                
+     # byline cleaning
+     t.temp$byline <- gsub("^[A-Z][a-z]+ ", "", t.temp$byline)
+     t.temp$byline <- gsub("by ", "", t.temp$byline)
+     t.temp$byline <- gsub(" and", ",", t.temp$byline)
+     t.temp$byline <- gsub(" with", ",", t.temp$byline)
+     t.temp$byline <- gsub("ROBERT KLITZMAN, M.D", "ROBERT KLITZMAN MD", t.temp$byline)
+     
+     ## Count the number of commas left, represents  #columns - 1
+     nc <- function(vec){
+          nc <- 0
+          for(i in 1:length(vec)){
+               x <- str_count(vec[i], ",")
+               if(nc < x){
+                    nc <- x
+               }
+          }
+          return(nc)
+     }
+     
+     ## Define names of new columns
+     newc <- function(vec, header){
+          x <- character(length = nc(vec) + 1)
+          for(i in 1:length(x)){
+               x[i] <- paste(header, i, sep = "")
+          }
+          return(x)
+     }
+     
+     ## Separate the authors into columns, retain original author names
+     t.temp <- t.temp %>% 
+          separate(byline, into = newc(t.temp$byline, "author"), remove = FALSE, sep = ", ")
+     
+     # keywords cleaning
+     t.temp$keywords <- gsub("\\[[']*", "", t.temp$keywords)
+     t.temp$keywords <- gsub('"', "'", t.temp$keywords)
+     t.temp$keywords <- gsub("[']*\\]", "", t.temp$keywords)
+     t.temp$keywords <- gsub("', '", ":", t.temp$keywords)
+    
+     t.temp <- t.temp %>% 
+          separate(keywords, into = newc(t.temp$keywords, "keyword"), remove = FALSE, sep = ":")
+     
+     
+     # snippet cleaning
+     t.temp$snippet <- gsub("(u\\.s\\.)", "unitedstates", t.temp$snippet, ignore.case = TRUE)
+     t.temp$snippet <- gsub("(u\\.s\\.a\\.)", "unitedstates", t.temp$snippet, ignore.case = TRUE)
+     t.temp$snippet <- gsub("US", "unitedstates", t.temp$snippet, ignore.case = FALSE)
+     t.temp$snippet <- gsub("USA", "unitedstates", t.temp$snippet, ignore.case = FALSE)
+     
+     t.temp$snippet <- gsub("(u\\.k\\.)", "unitedkingdom", t.temp$snippet, ignore.case = TRUE)
+     t.temp$snippet <- gsub("UK", "unitedkingdom", t.temp$snippet, ignore.case = FALSE)
+     
+     ## Replace certain punctuation with word representations
+     t.temp$snippet <- gsub("$", "dollarSign", t.temp$snippet)
+     t.temp$snippet <- gsub("@", "atSign", t.temp$snippet)
+     t.temp$snippet <- gsub("\\.", " ", t.temp$snippet)
+     t.temp$snippet <- gsub("'", "", t.temp$snippet)
+     t.temp$snippet <- gsub("-", "", t.temp$snippet)
+     
+     
+     ## Remove the rest of the punctuation and fix whitespace
+     t.temp$snippet <- gsub("[[:punct:]]", " ", t.temp$snippet)
+     #t.temp$snippet <- gsub("")
+     t.temp$snippet <- trimws(stripWhitespace(t.temp$snippet))
+     
+     # Write out temporary df to the corresponding i in data     
+     assign(i, t.temp)
+     rm(t.temp)
+}
+
+stopCluster(cl)
+
+# Create new directory as defined above
+dir.create(loc)
+setwd(loc)
+# Write out all files to the new directory
+for(i in data){
+     fwrite(get(i), paste(i)) 
+} 
+
+rm(list=ls())
+```
+
+```{r CleanSentData, eval = FALSE}
+library(stringr)
+library(tm)
+
+seed <- 4559
+# Link to data used in analysis: https://www.kaggle.com/aashita/nyt-comments
+ 
+# Where to write cleaned files
+setwd("C:/Users/rdh8eg.MCINTIRE.000/Downloads/nyt-comments/") 
+loc <- paste(getwd(), "/Sentiment_Data_Clean/", sep = "")
+
+# Number of articles to sample per month
+n <- 200
+
+# Set seed for reproducibility. Important becasue start the project with sampling
+set.seed(seed)
+
+
+# Get names of all relevant files in the working directory, classify
+articles <- list.files(pattern = "^Articles")
+comments <- list.files(pattern = "^Comments")
+
+# Delete any file in the directory that is not one of the original files
+
+if(readline("Do you want to delete additional files (Y/N)?: ") == "Y"){
+  if(dir.exists(loc)){
+  setwd(loc)
+  file.remove(list.files())
+  setwd("../")
+  file.remove(loc, recursive = TRUE)
+  }
+
+  del <- list.files()
+  del <- del[-which(del %in% c(comments, articles, "ngrams_Data_Clean"))]
+
+  file.remove(del)
+}
+
+
+# set up parallel processing for faster processing
+try(stopCluster(cl), silent = TRUE) # stop parallel interface if started/running
+message(paste("Cores detected:", detectCores(logical = FALSE)))
+cl <- makePSOCKcluster(detectCores(logical = FALSE))
+registerDoParallel(cl) # initialize new parallel interface
+
+
+# Read in articles  with sample size n, join with related comments file
+for(i in articles){
+     t.pos <- unlist(str_locate(i, "\\."))
+     
+     t.nam <- substring(i, 0, t.pos[1] - 1)
+     
+     assign(t.nam, sample_n(fread(i), n))
+
+     t.dpos <- unlist(str_locate(i, "s[A-Z]"))
+     t.date <- substring(i, t.dpos[2])
+     t.com <- comments[grep(t.date, comments)]
+     t.com <- fread(t.com)
+     
+     assign(t.nam, get(t.nam) %>% 
+          left_join(t.com))
+}
+
+rm(list = ls(pattern = "^t\\."))
+
+
+data <- ls(pattern = "^[A-Z]")
+
+
+# Preliminary cleaning of all relevant fields
+for(i in data){
+     t.temp <- get(i)
+     
+     # Drop non Article Categories
+     t.temp <- t.temp %>% 
+          filter(!newDesk == "Games") %>% 
+          select(-picURL, -webURL, -commentTitle,
+                 -userDisplayName, -userLocation,
+                 -userTitle, -userURL, -permID,
+                 -parentUserDisplayName) 
+     
+     # Transform character variables, doesn't work w/o controlling for missing abstract
+     if(length(t.temp) == 35){
+          t.temp <- t.temp %>% 
+               mutate(snippet = as.character(snippet),
+                      headline = as.character(headline),
+                      byline = as.character(byline),
+                      abstract = as.character(abstract),
+                      keywords = as.character(keywords),
+                      pubDate = as_date(pubDate),
+                      approveDate = as_date(approveDate),
+                      commentBody = as.character(commentBody),
+                      createDate = as_date(createDate),
+                      updateDate = as_date(updateDate))
+     }
+     else{
+          t.temp <- t.temp %>% 
+               mutate(snippet = as.character(snippet),
+                      headline = as.character(headline),
+                      byline = as.character(byline),
+                      keywords = as.character(keywords),
+                      pubDate = as_date(pubDate),
+                      approveDate = as_date(approveDate),
+                      commentBody = as.character(commentBody),
+                      createDate = as_date(createDate),
+                      updateDate = as_date(updateDate))
+     }
+
+     
+     # commentBody cleaning
+     ## Words/acronyms that we wish to protect
+     t.temp$commentBody <- gsub("(u\\.s\\.)", "unitedstates", t.temp$commentBody, ignore.case = TRUE)
+     t.temp$commentBody <- gsub("(u\\.s\\.a\\.)", "unitedstates", t.temp$commentBody, ignore.case = TRUE)
+     t.temp$commentBody <- gsub("US", "unitedstates", t.temp$commentBody, ignore.case = FALSE)
+     t.temp$commentBody <- gsub("USA", "unitedstates", t.temp$commentBody, ignore.case = FALSE)
+     
+     t.temp$commentBody <- gsub("(u\\.k\\.)", "unitedkingdom", t.temp$commentBody, ignore.case = TRUE)
+     t.temp$commentBody <- gsub("UK", "unitedkingdom", t.temp$commentBody, ignore.case = FALSE)
+     
+     ## Replace certain punctuation with word representations
+     t.temp$commentBody <- gsub("$", "dollarSign", t.temp$commentBody, fixed = TRUE)
+     t.temp$commentBody <- gsub("@", "atSign", t.temp$commentBody)
+     t.temp$commentBody <- gsub("\\.", " ", t.temp$commentBody)
+     t.temp$commentBody <- gsub("'", "", t.temp$commentBody)
+     t.temp$commentBody <- gsub("-", "", t.temp$commentBody)
+     t.temp$commentBody <- gsub("<br>", "", t.temp$commentBody)
+     
+     
+     ## Remove the rest of the punctuation and fix whitespace
+     t.temp$commentBody <- gsub("[[:punct:]]", " ", t.temp$commentBody)
+     t.temp$commentBody <- trimws(stripWhitespace(t.temp$commentBody))
+     
+                                
+     # byline cleaning
+     t.temp$byline <- gsub("^[A-Z][a-z]+ ", "", t.temp$byline)
+     t.temp$byline <- gsub("by ", "", t.temp$byline)
+     t.temp$byline <- gsub(" and", ",", t.temp$byline)
+     t.temp$byline <- gsub(" with", ",", t.temp$byline)
+     t.temp$byline <- gsub("ROBERT KLITZMAN, M.D", "ROBERT KLITZMAN MD", t.temp$byline)
+     
+     ## Count the number of commas left, represents  #columns - 1
+     nc <- function(vec){
+          nc <- 0
+          for(i in 1:length(vec)){
+               x <- str_count(vec[i], ",")
+               if(nc < x){
+                    nc <- x
+               }
+          }
+          return(nc)
+     }
+     
+     ## Define names of new columns
+     newc <- function(vec, header){
+          x <- character(length = nc(vec) + 1)
+          for(i in 1:length(x)){
+               x[i] <- paste(header, i, sep = "")
+          }
+          return(x)
+     }
+     
+     ## Separate the authors into columns, retain original author names
+     t.temp <- t.temp %>% 
+          separate(byline, into = newc(t.temp$byline, "author"), remove = FALSE, sep = ", ")
+     
+     # keywords cleaning
+     t.temp$keywords <- gsub("\\[[']*", "", t.temp$keywords)
+     t.temp$keywords <- gsub('"', "'", t.temp$keywords)
+     t.temp$keywords <- gsub("[']*\\]", "", t.temp$keywords)
+     t.temp$keywords <- gsub("', '", ":", t.temp$keywords)
+    
+     t.temp <- t.temp %>% 
+          separate(keywords, into = newc(t.temp$keywords, "keyword"), remove = FALSE, sep = ":")
+     
+     
+     # snippet cleaning
+     t.temp$snippet <- gsub("(u\\.s\\.)", "unitedstates", t.temp$snippet, ignore.case = TRUE)
+     t.temp$snippet <- gsub("(u\\.s\\.a\\.)", "unitedstates", t.temp$snippet, ignore.case = TRUE)
+     t.temp$snippet <- gsub("US", "unitedstates", t.temp$snippet, ignore.case = FALSE)
+     t.temp$snippet <- gsub("USA", "unitedstates", t.temp$snippet, ignore.case = FALSE)
+     
+     t.temp$snippet <- gsub("(u\\.k\\.)", "unitedkingdom", t.temp$snippet, ignore.case = TRUE)
+     t.temp$snippet <- gsub("UK", "unitedkingdom", t.temp$snippet, ignore.case = FALSE)
+     
+     ## Replace certain punctuation with word representations
+     t.temp$snippet <- gsub("$", "", t.temp$snippet)
+     t.temp$snippet <- gsub("@", "atSign", t.temp$snippet)
+     t.temp$snippet <- gsub("-", "", t.temp$snippet)
+     
+     
+     ## Remove the rest of the punctuation and fix whitespace
+     #t.temp$snippet <- gsub("")
+     t.temp$snippet <- trimws(stripWhitespace(t.temp$snippet))
+     
+     # Write out temporary df to the corresponding i in data     
+     assign(i, t.temp)
+     rm(t.temp)
+}
+
+stopCluster(cl)
+
+# Create new directory as defined above
+dir.create(loc)
+setwd(loc)
+# Write out all files to the new directory
+for(i in data){
+     fwrite(get(i), paste(i)) 
+} 
+
+rm(list=ls())
+```
+
+
+## Machine Learning
+
+What makes a comment on a news article a “good” comment, or worthy of an editor’s attention and promotion? This is the question we sought to answer in our machine learning classification task, in which we attempt to train a model to predict if a comment will be selected by the editor for premium presentation, or if a comment will simply fade into a sea of others without the editor’s handpicked approval.
+
+Machine learning is appropriately applied here because our target variable is binary – a comment is either selected by an editor or it is not – and ML algorithms are particularly well suited for classification when a large training set is available. In our case, we have almost 2 million comments at our disposal, which is far more than enough to sufficiently train a model for prediction. We can also identify which variables are most important to the model when classifying a comment, and use those results to perform further exploratory analyses.  
+
+From a philosophical standpoint, this analysis can give a look into the characteristics of content getting featured on one of America’s most read and trusted sources of news, and perhaps afford a window into the underpinnings of the American psyche itself. On a more practical note, any digital news outlet looking to feature good comments could use this model to significantly narrow the comments they would need to browse through to select one worth being featured (for example, set a threshold at 95% confident that a comment would be selected by a NYT editor, and then choose a comment to feature from that small pool).  
+
+### ML-Specific Data Cleaning
+
+In addition to the global level cleaning we performed for our analyses, we did additional cleaning to prepare the comment text for input into the machine learning algorithms. First, we removed punctuation, numbers, and stemmed the words. Then, we removed stopwords using the quanteda package english stopwords dictionary, as well as a list of our own custom stopwords that we thought might appear in many comments and mean very little. Finally, we tokenized the data into single words and bigrams. 
+
+```{r ReadNGramData}
+rm(list = ls())
+
+setwd("C:/Users/rdh8eg.MCINTIRE.000/Downloads/nyt-comments/ngrams_Data_Clean/")
+data <- list.files()
+
+for(i in data){
+  assign(i, fread(i))
+  
+  temp <- get(i)
+  
+  temp$editorsSelection <- as.integer(temp$editorsSelection)
+  
+  assign(i, temp)
+  rm(temp)
+}
+
+
+artcom_ngram <- ArticlesApril2017
+for(i in data[-1]){
+  artcom_ngram <- artcom_ngram %>% 
+    bind_rows(get(i))
+}
+
+artcom_ngram$editorsSelection <- as.factor(artcom_ngram$editorsSelection)
+```
+
+
+```{r tokenize the data}
+# when using quanteda, if you want to remove stopwords and use n-grams, you must first remove the stop words from your text before greating n-grams.  First, we tokenize our text data by word, then remove stopwords, letters, and our custom stop words
+toks <- tokens(artcom_ngram$commentBody, remove_punct = TRUE, remove_numbers = TRUE)
+toks2 <- tokens_remove(toks, c(stopwords("english"), letters, "article", "news", "today", "yesterday", "year", "month", "week", "br", "br_br"))
+toks2 <- tokens_wordstem(toks2)
+
+# we can now create a document feature matrix from our text.  By default, it will simply create the matrix by word, but if you want to include n-grams of different length, you can specify the range of ngrams you want to use.
+datDFM <- dfm(toks2,
+              ngrams = 1:2)
+```
+
+The most common tokens by count in this dataset are displayed in the table below.
+```{r topFeature_DFM}
+
+set.caption("Most Common Wordstems")
+topfeatures(datDFM) %>% 
+  pander()# inspect the top features of this matrix
+```
+
+```{r tf_idf}
+# The dfm above is based solely on count.  If you wish to use tf-idf scores in your machine learning, you can calculate tf-idf scores and place them into the matrix.  Note that quanteda uses count as the default for tf, not the percentage of words in the document.  If you want it to use the same formulas we have been using in class, change the scheme_tf setting to be "prop"
+datDFM_tfidf <- dfm_tfidf(
+  datDFM,
+  scheme_tf = "prop")
+
+set.caption("Highest TF-IDF Wordstems")
+topfeatures(datDFM_tfidf) %>% 
+  pander()
+
+p <- .985
+```
+
+
+The resulting document feature matrix is`r scales::percent(sparsity(datDFM_tfidf), accuracy = .001)`, so the following code trims the most sparse features to reach a sparsity of `r scales::percent(p)`.
+
+```{r sparcity}
+# To create a better balance between speed, accuracy, and generalizability, we can reduce the sparsity of this matrix to zero in on words/n-grams that are more representative of a larger number of documents.  At the same time, we can convert our matrix into a data frame object for easier manipulation throughout the rest of this analysis.
+
+datDFM_df <- datDFM_tfidf %>%
+  dfm_trim(sparsity = p) %>% # reduce sparsity (note: setting dependent on data)
+  convert(to = "data.frame") %>%
+  clean_names() %>% # clean up names as necessary
+  as_tibble(.name_repair = "universal") # fix potential column name issues
+
+#View(head(datDFM_df))
+# Our tf-idf data does not include the outcome variable so let's merge the values of the outcome variable into this data frame to create one master data frame for the entire analysis.
+
+fullDat <- artcom_ngram %>%
+  select(editorsSelection, depth, recommendations, typeOfMaterial) %>%
+  bind_cols(datDFM_df %>% 
+              select(-1)) %>% 
+  filter(!is.na(editorsSelection)) 
+
+fullDat$editorsSelection <- as.factor(fullDat$editorsSelection)
+fullDat$typeOfMaterial <- as.factor(fullDat$typeOfMaterial)
+
+# We now have a data.frame object we can use for machine learning:
+
+# fullDat 
+# dim(fullDat) 
+
+``` 
+
+### Basic methodology
+
+After cleaning and pre-processing the data, we split the comments from the 150 articles sampled (approximately 150,000 comments in total) into a training set and a test set. Additionally, we added three more predictor variables including *depth* (whether or not a comment is original, a reply, or a reply to a reply), *recommendation* (how many times a comment was upvoted) and *typeOfMaterial* (the type of article attached to the comments, e.g. OpEd). Since *typeOfMaterial* was originally a character, we created dummy variables for $n-1$ levels of the data. The first level was omitted to prevent multicolinearity issues with certain models.
+
+We used a 71% training – 29% testing split, but many splits could be considered reasonable here; we wanted over 2/3 of our data allocated to training, since the analysis is low stakes and doesn’t require rigorous testing to get an estimate of the model’s approximate worth.
+
+```{r data prep for ML}
+library(caret)
+# ---------------------------
+# Machine Learning: Data Prep
+# ---------------------------
+
+set.seed(543)
+
+fullDat <- fastDummies::dummy_cols(fullDat, select_columns = "typeOfMaterial", remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+```
+
+The table below shows the distribution of our target variable, *editorsSelection.* Only `r scales::percent(table(fullDat$editorsSelection)[2]/sum(table(fullDat$editorsSelection)))` of the comments observed were selected by the NYT editors to be featured.This pattern will likely appear within the training and testing partition as well. We will downsample the training dataset to create balance between the classes. Since we are working with text data and have `r ncol(fullDat)` features, we do not believe the quality of our analysis will be impaired.
+
+```{r ClassBalance}
+set.caption("Class Balance")
+table(fullDat$editorsSelection) %>% 
+  pander()# note the class balance is equal
+```
+
+```{r MoreMLPrep}
+# Split the data into training and test samples, in this case we'll use 70% for training
+
+trainIndex <- createDataPartition(fullDat$editorsSelection, p = .71,
+                                  list = FALSE,
+                                  times = 1)
+
+artTrain <- fullDat[ trainIndex,]
+artTest  <- fullDat[-trainIndex,]
+
+at <- nrow(artTrain)
+
+artTrain <- downSample(artTrain, artTrain$editorsSelection, list=TRUE)$x
+```
+
+While the original training data had `r at` observations, the newly downsampled one has only `r nrow(artTrain)`. This is still sufficient to train our models, and may be beneficial given constraints in both time and processing power. The last step of data preprocessing was to remove any features which had zero variance.
+
+
+
+```{r LastStretchMLPrep}
+# Let's also do zero variance (ZV) removal:
+
+edSel.preProc <- preProcess(artTrain, 
+                            method = c("zv"))
+
+
+artTrain.clean <- predict(edSel.preProc, artTrain)
+artTest.clean  <- predict(edSel.preProc, artTest) # we impute/remove columns in the test data based on the training data set values
+
+```
+
+
+After downsampling the data, we set up tuning grids to set parameters for four algorithms: **Recursive Partioning** (rpart), Gradient Boosted Machine (gbm); **C5.0**, a variant of a gbm in the AdaBoost algorithm class); and a variation of the **Generalized Linear Model** (glm), logistic regression. We then fit the models using the training set and evaluated their respective predictive performances. While we originally intended to run 6, both **Random Forest** (rf) and **Support Vector Machine** (svm) algorithms proved too computationionally intensive for our data, so they had to be removed from the analysis.
+
+### Setting Model Parameters
+
+The `Caret` package has the ability to set tuning grids that provide various parameters or bounds that the machine should use when determining an optimum prediction model.  This chunk will set those parameters.
+
+```{r model prep}
+
+# first, we will set all models to use 5 fold cross validation
+
+ctrl <- trainControl(method = "cv", number = 5)
+
+
+# Now let's set up parameters for each of the models:
+# Note that GLM (logistic regression) does not have any tuning parameters
+
+tuneGrid.rpart <- expand.grid(
+  cp = c(.01, .03, .05)
+)
+
+tuneGrid.gbm <- expand.grid(
+  interaction.depth = 5,
+  n.trees = c(150, 500),
+  shrinkage = .10,
+  n.minobsinnode = 5
+)
+
+tuneGrid.C5.0 <-  expand.grid(
+  winnow = TRUE,
+  trials = 100,
+  model = c("tree", "rules")
+)
+
+``` 
+
+### Running The Differet Models
+
+We will not use Caret to create prediction models using 4 different algorithms.  For each model, we will time how long it takes to train the model so that we can see the tradeoff between accuracy and speed.
+
+```{r run models}
+# ----------------------------
+# Machine Learning: Run Models
+# ----------------------------
+
+# install.packages("gbm")
+# install.packages("C50")
+# install.packages("randomForest")
+# #install.packages("parallel")
+# #install.packages("doParallel")
+# install.packages("mvtnorm")
+library(parallel)
+library(doParallel)
+library(gbm)
+library(C50)
+library(e1071)
+
+# set up parallel processing for faster processing
+try(stopCluster(cl), silent = TRUE) # stop parallel interface if started/running
+message(paste("Cores detected:", detectCores(logical = FALSE)))
+cl <- makePSOCKcluster(detectCores(logical = FALSE))
+registerDoParallel(cl) # initialize new parallel interface
+
+
+# rpart (Recursive Partitioning and Regression Trees)
+
+start <- proc.time() # to time code
+
+editorsSelection.train.rpart <- train(
+  y = as.factor(artTrain.clean$editorsSelection),
+  x = subset(artTrain.clean, select = -c(editorsSelection)),
+  method = "rpart",
+  trControl = ctrl,
+  tuneGrid = tuneGrid.rpart,
+  na.action = na.pass)
+
+rpart.runTime <- proc.time() - start # elapsed
+
+# gbm (Generalized Boosted Regression Modeling)
+
+start <- proc.time() # to time code
+
+editorsSelection.train.gbm <- train(
+  y = as.factor(artTrain.clean$editorsSelection),
+  x = subset(artTrain.clean, select = -c(editorsSelection)),
+  method = "gbm",
+  trControl = ctrl,
+  tuneGrid = tuneGrid.gbm,
+  verbose = FALSE)
+
+gbm.runTime <- proc.time() - start # elapsed
+
+# Logistic Regression
+start <- proc.time() # to time code
+
+editorsSelection.train.glm <- train(
+  y = as.factor(artTrain.clean$editorsSelection),
+  x = subset(artTrain.clean, select = -c(editorsSelection)),
+  method = "glm",
+  trControl = ctrl,
+  family = binomial,
+  maxit = 100)
+
+glm.runTime <- proc.time() - start # elapsed
+
+
+# C5.0 (Decision Trees and Rule-Based Models)
+
+start <- proc.time() # to time code
+
+editorsSelection.train.C5.0 <- train(
+  y = as.factor(artTrain.clean$editorsSelection),
+  x = subset(artTrain.clean, select = -c(editorsSelection)),
+  method = "C5.0",
+  trControl = ctrl,
+  tuneGrid = tuneGrid.C5.0,
+  na.action = na.pass)
+
+C5.0.runTime <- proc.time() - start # elapsed
+
+
+stopCluster(cl)
+
+```
+
+***Note:*** *The results from the glm may be unreliable as the algorithm does not converge in this context. Consequently, instances of 0 and 1 occurred in the fitted probabilities.*
+
+### Comparing Performance of Models
+
+We can now look at the runtime and balanced accuracy of each model to see which models perform better than others.
+
+```{r model eval}
+# extract run times for each model
+
+runTimes <- tibble(
+  model = c("rpart", "gbm", "glm", "C5.0"),
+  runtime = c(rpart.runTime["elapsed"],
+              gbm.runTime["elapsed"],
+              glm.runTime["elapsed"],
+              C5.0.runTime["elapsed"]
+              ))
+# plot run times
+ggplot(runTimes, aes(x = reorder(model, -runtime), y = runtime, fill = factor(runtime))) +
+  geom_bar(stat = "identity") +
+  theme_bw(base_size = 16) +
+  labs(title = "Model Fit Time",
+       caption = "Lower is better",
+       y = "Time (Seconds)",
+       x = "Model") +
+  theme(legend.position = "none")
+```
+
+```{r PerformStats}
+# We can also compare model performance statistics (e.g., accuracy, kappa) on the training data visually:
+
+compareModels <- resamples(list(rpart = editorsSelection.train.rpart,
+                                gbm = editorsSelection.train.gbm,
+                                C5.0 = editorsSelection.train.C5.0,
+                                glm = editorsSelection.train.glm))
+
+
+dotplot(compareModels, main = "Model Performance Statistics")
+
+```
+
+### Evaluating Performance of Predictions Using Test Data
+
+We can use each of our five models to make predictions on our test data.  For each model, we will generate both simple class predictions as well as the probabilities of belonging to class= 1 (debt document).  Confusion matrices will also be constructed for each model and we can directly compare various accuracry statistics to select the best performing model.
+
+```{r eval performance}
+# To evaluate performance on the testing data, first we need to generate predictions using each model:
+
+Predictions.rpart <- predict(editorsSelection.train.rpart, newdata = artTest.clean)
+Predictions.gbm <- predict(editorsSelection.train.gbm, newdata = artTest.clean)
+Predictions.C5.0 <- predict(editorsSelection.train.C5.0, newdata = artTest.clean)
+Predictions.glm <- predict(editorsSelection.train.glm, newdata = artTest.clean)
+
+
+# we can also generate probabilities of falling into the debt=true class using each of our models
+PredictionProbs.rpart <- predict(editorsSelection.train.rpart, newdata = artTest.clean, type = "prob")
+PredictionProbs.gbm <- predict(editorsSelection.train.gbm, newdata = artTest.clean, type = "prob")
+PredictionProbs.C5.0 <- predict(editorsSelection.train.C5.0, newdata = artTest.clean, type = "prob")
+PredictionProbs.glm <- predict(editorsSelection.train.glm, newdata = artTest.clean, type = "prob")
+
+
+# Now we can compare model performance on test data using confusion matrices (i.e., compare true debt classification to predicted debt classification):
+
+rpart.CM <- confusionMatrix(data = Predictions.rpart, reference = artTest$editorsSelection, positive = "1")
+gbm.CM <- confusionMatrix(data = Predictions.gbm, reference = artTest$editorsSelection, positive = "1")
+C5.0.CM <- confusionMatrix(data = Predictions.C5.0, reference = artTest$editorsSelection, positive = "1")
+glm.CM <- confusionMatrix(data = Predictions.glm, reference = artTest$editorsSelection, positive = "1")
+
+
+# We could use these confusion matrices to compare models; for example, compare/contrast rpart vs. gbm:
+```
+
+In terms of pure accuracy, GBM is the best model, as shown above. However, it is also important to consider other performance metrics. The tables below show the confusion matrixes for the two most accurate models.
+
+#### Gradient Boosted Machine Confusion Matrix
+```{r MostAccurateCM1}
+gbm.CM
+```
+
+#### C5.0 Confusion Matrix
+```{r MostAccurateCM2}
+C5.0.CM 
+```
+
+The confusion matrices produce a wealth of performance statistics for each pf the model fits, which are printed in the dataframe below:
+
+```{r CompareKeyMetr}
+# We can also pull out key metrics to compare models:
+testComparison <- bind_rows(rpart.CM$byClass,
+                            gbm.CM$byClass,
+                            C5.0.CM$byClass,
+                            glm.CM$byClass) %>%
+  mutate(Model = c("rpart", "gbm", "C5.0", "glm")) %>%
+  left_join(runTimes, by = c("Model" = "model")) %>%  
+  rename(Runtime = runtime) %>% 
+  select(Model, everything())
+
+testComparison # see everything
+```
+
+However, we intend to focus on the models' Precision, Balanced Accuracy, and F1 statistics. In choosing which statistics to prioritize, we considered the circumstances in which our model could be applied. Given the volume of comments NYT receives, our model is most helpful if it eliminates most of these comments, leaving the editors with relatively few to select from. Moreover, if a comment that may have been worthy of editor selection slips through the cracks, there is almost no consequence, since the model will also select plenty of other worthy comments to present to the editor. As such, we want our model to lean towards selecting fewer false positives and more false negatives, and maximize the number of comments that are actually worthy of being selected out of all the comments the model recommends the editor read through. 
+
+The best model will therefore have the highest percentage of true positive classifications out of all positive classifications, and this is the definition of precision. We also want the model to correctly classify as many positive and negative comments out of all the possible positive and negative comments, so the balanced accuracy provides an excellent holistic evaluation of the model’s performance. Finally, we used the F1 statistic to average the precision and sensitivity, allowing us to see the model’s performance in correctly selecting editor’s choice comments out of all the comments it selects and out of all the comments it ought to select. 
+```{r KeyMetr}
+set.caption("Key Model Statistics")
+testComparison %>%
+  select(Model, `Precision`, `Balanced Accuracy`, `F1`, `Runtime`) %>%
+  arrange(desc(`Precision`)) %>% 
+  pander()# comparing Precision
+```
+
+```{r PlotTime-Prec}
+# Create a plot comparing run time against the single accuracy statistic you believe is the best way of evaluating overall model performance.  In the code below, replace every instance of "chosen_stat" with the name of that statistic (from the column names in "testComparison") 
+ggplot(testComparison, aes(x = reorder(Model, -`Precision`), y = `Precision`, fill = Runtime)) + 
+  geom_bar(stat = "identity") +
+  theme_bw(base_size = 16) + 
+  labs(title = "Precision on Test Data",
+       caption = "Higher Precision is better\nGreener bars indicate faster fitting models",
+       fill = "Runtime (s)",
+       y = "Precision",
+       x = "Model") +
+  scale_y_continuous(limits = c(0, .12)) +
+  scale_fill_gradient(low = "green", 
+                      high = "red")
+```
+
+### Evaluating ROC Curves
+
+Another way of evaluating how good our models are is to generate ROC curves.  Good models have high area under the curve (AUC) and represent a strong balance between false positives and false negatives.
+
+```{r roc eval}
+library(pROC)
+library(car)
+
+# Let's also compare models via receiver operating characteristic (ROC) using the test data. For this comparison, higher scores are better:
+
+rpart.ROC <- roc(
+  predictor = PredictionProbs.rpart[, 2],
+  response = artTest.clean$editorsSelection,
+  levels = levels(artTest.clean$editorsSelection))
+
+gbm.ROC <- roc(
+  predictor = PredictionProbs.gbm[, 2],
+  response = artTest.clean$editorsSelection,
+  levels = levels(artTest.clean$editorsSelection))
+
+C5.0.ROC <- roc(
+  predictor = PredictionProbs.C5.0[, 2],
+  response = artTest.clean$editorsSelection,
+  levels = levels(artTest.clean$editorsSelection))
+
+glm.ROC <- roc(
+  predictor = PredictionProbs.glm[, 2],
+  response = artTest.clean$editorsSelection,
+  levels = levels(artTest.clean$editorsSelection))
+
+# Display AUC values
+```
+
+\begin{center}
+**Area Under Curve for Models**
+\hline
+\begin{tabular}{ll}
+Model & AUC \\ \hline
+RPart & `r scales::percent(auc(rpart.ROC)[1], accuracy = .01)` \\
+GBM & `r scales::percent(auc(gbm.ROC)[1], accuracy = .01)` \\
+C5.0 & `r scales::percent(auc(C5.0.ROC)[1], accuracy = .01)` \\
+GLM & `r scales::percent(auc(glm.ROC)[1], accuracy = .01)` \\ \hline
+\end{tabular}
+\end{center}
+
+```{r AUCVec}
+# Combine AUC values into single vector
+AUCs <- c(auc(rpart.ROC), auc(gbm.ROC), auc(C5.0.ROC), auc(glm.ROC))
+bestOrder <- order(AUCs, decreasing = TRUE)
+models <- paste0(c("rpart", "gbm", "C5.0", "glm"), " (", round(AUCs, 2), ")")
+
+ggroc(list(rpart.ROC, gbm.ROC, C5.0.ROC, glm.ROC)[bestOrder], size = 1) +
+  geom_abline(intercept = 1, slope = 1, size = 2, alpha = .2, linetype = 2) +
+  scale_color_manual(values = c("red", "green", "blue", "orange"),
+                     labels = models[bestOrder]) +
+  theme_bw(base_size = 16) +
+  labs(title = "Test Data ROCs",
+       color = "Model (AUC)",
+       x = "Specificity",
+       y = "Sensitivity")
+```
+
+### Examining Variables of Importance
+
+Our initial run of the models shows that *recommendations* has an outsized influence on whether or not a comment will be chosen as an editor's pick. Recommendations are essentially how many likes a comment has. Since we cannot say with certainty whether or not these votes were assigned before or after a comment was selected as an editor's pick, we decided the run the models again, ommiting this feature.
+
+```{r VarImp}
+# If we are interested in seeing the most important terms in prediction, they are simply the "variables" that are most influential in the model.  To extract the most important terms, we can use "varImp" and it will display which variables from the model are the most influential predictors.  Since GBM is our top performing model, this code extracts the terms from the gbm model, but we could change it to reference any of the models in our script.
+
+plot(varImp(editorsSelection.train.gbm, scale = FALSE), 10, main = " GBM Variables of Importance")
+```
+
+### Omitting *recommendations*
+
+```{r}
+# set up parallel processing for faster processing
+try(stopCluster(cl), silent = TRUE) # stop parallel interface if started/running
+message(paste("Cores detected:", detectCores(logical = FALSE)))
+cl <- makePSOCKcluster(detectCores(logical = FALSE))
+registerDoParallel(cl) # initialize new parallel interface
+
+
+# rpart (Recursive Partitioning and Regression Trees)
+
+start <- proc.time() # to time code
+
+editorsSelection.train.rpart_exRec <- train(
+  y = as.factor(artTrain.clean$editorsSelection),
+  x = subset(artTrain.clean, select = -c(editorsSelection, recommendations)),
+  method = "rpart",
+  trControl = ctrl,
+  tuneGrid = tuneGrid.rpart,
+  na.action = na.pass)
+
+rpart.runTime_exRec <- proc.time() - start # elapsed
+
+# gbm (Generalized Boosted Regression Modeling)
+
+start <- proc.time() # to time code
+
+editorsSelection.train.gbm_exRec <- train(
+  y = as.factor(artTrain.clean$editorsSelection),
+  x = subset(artTrain.clean, select = -c(editorsSelection, recommendations)),
+  method = "gbm",
+  trControl = ctrl,
+  tuneGrid = tuneGrid.gbm,
+  verbose = FALSE)
+
+gbm.runTime_exRec <- proc.time() - start # elapsed
+
+# Logistic Regression
+start <- proc.time() # to time code
+
+editorsSelection.train.glm_exRec <- train(
+  y = as.factor(artTrain.clean$editorsSelection),
+  x = subset(artTrain.clean, select = -c(editorsSelection, recommendations)),
+  method = "glm",
+  trControl = ctrl,
+  family = binomial,
+  maxit = 100)
+
+glm.runTime_exRec <- proc.time() - start # elapsed
+
+
+# C5.0 (Decision Trees and Rule-Based Models)
+
+start <- proc.time() # to time code
+
+editorsSelection.train.C5.0_exRec <- train(
+  y = as.factor(artTrain.clean$editorsSelection),
+  x = subset(artTrain.clean, select = -c(editorsSelection, recommendations)),
+  method = "C5.0",
+  trControl = ctrl,
+  tuneGrid = tuneGrid.C5.0,
+  na.action = na.pass)
+
+C5.0.runTime_exRec <- proc.time() - start # elapsed
+
+
+stopCluster(cl)
+
+
+runTimes_exRec <- tibble(
+  model = c("rpart", "gbm", "glm", "C5.0"),
+  runtime = c(rpart.runTime_exRec["elapsed"],
+              gbm.runTime_exRec["elapsed"],
+              glm.runTime_exRec["elapsed"],
+              C5.0.runTime_exRec["elapsed"]
+              ))
+
+Predictions.rpart_exRec <- predict(editorsSelection.train.rpart_exRec, newdata = artTest.clean)
+Predictions.gbm_exRec <- predict(editorsSelection.train.gbm_exRec, newdata = artTest.clean)
+Predictions.C5.0_exRec <- predict(editorsSelection.train.C5.0_exRec, newdata = artTest.clean)
+Predictions.glm_exRec <- predict(editorsSelection.train.glm_exRec, newdata = artTest.clean)
+
+PredictionProbs.rpart_exRec <- predict(editorsSelection.train.rpart_exRec, newdata = artTest.clean, type = "prob")
+PredictionProbs.gbm_exRec <- predict(editorsSelection.train.gbm_exRec, newdata = artTest.clean, type = "prob")
+PredictionProbs.C5.0_exRec <- predict(editorsSelection.train.C5.0_exRec, newdata = artTest.clean, type = "prob")
+PredictionProbs.glm_exRec <- predict(editorsSelection.train.glm_exRec, newdata = artTest.clean, type = "prob")
+
+# Now we can compare model performance on test data using confusion matrices (i.e., compare true debt classification to predicted debt classification):
+
+rpart.CM_exRec <- confusionMatrix(data = Predictions.rpart_exRec, reference = artTest$editorsSelection, positive = "1")
+gbm.CM_exRec <- confusionMatrix(data = Predictions.gbm_exRec, reference = artTest$editorsSelection, positive = "1")
+C5.0.CM_exRec <- confusionMatrix(data = Predictions.C5.0_exRec, reference = artTest$editorsSelection, positive = "1")
+glm.CM_exRec <- confusionMatrix(data = Predictions.glm_exRec, reference = artTest$editorsSelection, positive = "1")
+
+
+testComparison_exRec <- bind_rows(rpart.CM_exRec$byClass,
+                            gbm.CM_exRec$byClass,
+                            C5.0.CM_exRec$byClass,
+                            glm.CM_exRec$byClass) %>%
+  mutate(Model = c("rpart", "gbm", "C5.0", "glm")) %>%
+  left_join(runTimes_exRec, by = c("Model" = "model")) %>%  
+  rename(Runtime = runtime) %>% 
+  select(Model, everything())
+
+rpart.ROC_exRec <- roc(
+  predictor = PredictionProbs.rpart_exRec[, 2],
+  response = artTest.clean$editorsSelection,
+  levels = levels(artTest.clean$editorsSelection))
+
+gbm.ROC_exRec <- roc(
+  predictor = PredictionProbs.gbm_exRec[, 2],
+  response = artTest.clean$editorsSelection,
+  levels = levels(artTest.clean$editorsSelection))
+
+C5.0.ROC_exRec <- roc(
+  predictor = PredictionProbs.C5.0_exRec[, 2],
+  response = artTest.clean$editorsSelection,
+  levels = levels(artTest.clean$editorsSelection))
+
+glm.ROC_exRec <- roc(
+  predictor = PredictionProbs.glm_exRec[, 2],
+  response = artTest.clean$editorsSelection,
+  levels = levels(artTest.clean$editorsSelection))
+
+set.caption("Key Model Statistics, excluding recommendations")
+testComparison_exRec %>%
+  select(Model, `Precision`, `Balanced Accuracy`, `F1`, `Runtime`) %>%
+  arrange(desc(`Precision`)) %>% 
+  pander() # see everything
+```
+
+\begin{center}
+**Area Under Curve for Models, excluding *recommendations***
+\hline
+\begin{tabular}{ll}
+Model & AUC \\ \hline
+RPart & `r scales::percent(auc(rpart.ROC_exRec)[1], accuracy = .01)` \\
+GBM & `r scales::percent(auc(gbm.ROC_exRec)[1], accuracy = .01)` \\
+C5.0 & `r scales::percent(auc(C5.0.ROC_exRec)[1], accuracy = .01)` \\
+GLM & `r scales::percent(auc(glm.ROC_exRec)[1], accuracy = .01)` \\ \hline
+\end{tabular}
+\end{center}
+
+All performance metrics dropped substantially following the omission of *recommendations*. If we assume that editors select comments that seem popular amongst readers to promote, we can conclude that this is a very important variable to include in the analysis. However, we do not have sufficient information to make this assumption. Consequently, in order to avoid potentially training a model on its target, we will omit this feature from our final model. Without *recommendations*, the new variables of importance chart is:
+
+```{r}
+plot(varImp(editorsSelection.train.gbm_exRec, scale = FALSE), 10, main = " GBM Variables of Importance", sub = "Excluding recommendations",)
+```
+
+```{r}
+
+levels(fullDat$editorsSelection) <- c("No", "Yes")
+set.caption("Cross Table of Editor's Selection and Comment Depth")
+descr::CrossTable(fullDat$editorsSelection, fullDat$depth, dnn = c("Editor's Selection", "Depth")) %>% 
+  pander()
+```
+
+*depth* is the most important characteristic for determining whether or not a comment will be an editor's selection. When *depth* equals one, a comment is original, two signifies a reply, 3 a reply to a reply, etc. Depths one and two clearly dominate the data, with the majority being of *depth* = 1. The relative importance of this variable and the assocaited Cross Table allow us to conclude that editors are more likely to select an original comment than a reply. Below is a visual representation of the chart above.
+
+```{r}
+fullDat %>% 
+  ggplot(aes(x = editorsSelection)) + geom_bar() + facet_wrap(.~depth, scales = "free") +
+  labs(title = "Distribution of Editors Selection",
+       subtitle = "Separated by Comment Depth",
+       x = "",
+       y = "Count")
+```
+
+The other most important variables are all word stems, which suggest that content of the comment is the next most important criteria for selection.
+
+### Results
+
+In comparing the four trained models on these three statistics and their runtimes, prioritizing precision, we found that the **Gradient Boosted Machine** was the best algorithm for the New York Times' purpose since it outperforms other algorithms on all three chosen statistics with and without the recommendation variable in the dataset. Although precision is relatively low for all the models, when inspecting the confusion matrices, one can see that the gbm is eliminating the total number of comments an editor would have to read through by almost 85%, significantly reducing workload. The balanced accuracy is quite good for the gbm, and the model makes very few false negative errors; thus, if the Times wanted to further reduce the number of comments editors have to read through, they could simply raise the threshold for classifying a comment as positive.  
+
+
+### Justification for decisions made throughout the analysis
+
+In sampling articles from the dataset, which includes 9,000 articles across 10 months and 2 million total comments, we chose to select just 150 of these articles from each month for a total of 1500 articles. Since there are an average of 220 comments per article, we decided that sampling 100 articles, giving us 22,000 comments per month and 220,000 total, would be plenty for our learning task. However, we wanted to be sure to retain plenty of data even after downsampling, so we chose to sample 50 additional articles per month and err on the side of caution. 
+
+When addressing sparsity of the model, we chose to filter down to 97% sparsity. We tested a few values and found that decreasing sparsity to 95% cut out almost a third of the unique words in our analysis, while 99% hardly cut any and left us with a highly sparse matrix. So, we tried a compromise of 97% and found that we lost few unique words while cutting down on words that barely ever appear. 
+
+Lastly, we decided to tokenize into individual words and bigrams. By including both in our analysis, we knew we could detect single words that had significance across the corpus in predicting editor selections, as well as pairs of words that might clarify key differences in meaning (for example, “corona” is ambiguous, but a bigram tokenization distinguishes “corona virus” from “corona beer”). 
+
+## Sentiment Analysis
+
+```{r ReadSentimentData}
+setwd("C:/Users/rdh8eg.MCINTIRE.000/Downloads/nyt-comments/Sentiment_Data_Clean/")
+data <- list.files()
+
+for(i in data){
+  assign(i, fread(i))
+  
+  temp <- get(i)
+  
+  temp$editorsSelection <- as.integer(temp$editorsSelection)
+  
+  assign(i, temp)
+  rm(temp)
+}
+
+
+artcom_sentiment <- ArticlesApril2017 
+for(i in data[-1]){
+  artcom_sentiment <- artcom_sentiment %>% 
+    bind_rows(get(i))
+}
+
+artcom_sentiment$editorsSelection <- as.factor(artcom_sentiment$editorsSelection)
+```
+
+### Sentiment Analysis Data Prep
+
+In this chunk we set up the dataframe that would hold the variables we will use in our analysis. We merged all key variables in this dataframe and grouped them by the article ID. Finally we ran sentiment analysis on the variable "snippet" and joined those values with our initial dataframe. The data read in here underwent slightly different cleaning procedures than the data used in the machine learning section of our report. Sentiment analysis relies on punctuation to break the documents into sentence-length tokens; punctuation can also alter the interpretation of a token. Consequently, we did not remove punctation from this data.
+
+We also reduced the size of our data by only considering the variables *articleID*, *articleWordCount*, *pubDate* (when the article was published), *snippet* (a one to two sentence takeaway from the article, generated by the NYT), *newDesk* (which news desk published the piece), and *typeOfMaterial* (ex Blog, Article, OpEd).
+
+```{r Load and merge data George}
+# Sentiment analysis
+library(sentimentr)
+library(lexicon)
+library(ggplot2)
+
+# Load and merge data
+article_sample <- artcom_sentiment[,c("articleID", "articleWordCount", "pubDate", 
+                            "snippet", "newDesk", "typeOfMaterial")]
+
+article_sample <- article_sample %>% group_by(articleID) %>% 
+  distinct(articleID, articleWordCount, newDesk, pubDate, snippet, typeOfMaterial)
+
+jr_sentiment <- sentiment(get_sentences(article_sample$snippet), 
+                          polarity_dt = hash_sentiment_jockers_rinker, 
+                          valence_shifters_dt = lexicon::hash_valence_shifters)
+
+jr_sentiment <- cbind(article_sample$articleID, jr_sentiment)
+colnames(jr_sentiment)[1] <- "articleID"
+jr_sentiment <- left_join(article_sample, jr_sentiment, by = "articleID")
+```
+
+### Preliminary Sentiment Visualization
+
+In the following plots, we've displayed the sentiment scores by sentence for the first ten articles in the dataset, using the "jockers rinker" (JR) lexicon. These give a quick glance into the different polarities a NYT article may have, ranging from near-neutral to polarizing.
+
+```{r Preview JR Andrew}
+# Preview the sentiment scores by sentence for the first 10 articles
+jr_sentiment %>%
+    filter(element_id >= 1 & element_id <= 10) %>%
+    ggplot(aes(element_id, sentiment, fill = element_id)) +
+    geom_col( show.legend = FALSE) + ggtitle("Preview of JR Sentiment Scores of First 10 Articles") +
+    scale_x_continuous(breaks = seq(min(1), max(10), by = 1)) + 
+    xlab("Article Number") + ylab("Sentiment Score")
+```
+
+### Lexicon Comparison
+
+This chunk creates sentiment scores for the NRC, Slangsd, Socal, and huliu sentiments. We start by computing sentiment scores for each sentence in the article sample, similarly to how we evaluated sentiment using the Jockers Rinker lexicon earlier. The data is then merged into a master dataframe with all of the sentiment scores from each lexicon.
+
+```{r Lexicon comparisons Alex}
+# Lexicon comparisons
+
+# compute sentiment scores using nrc lexicon
+nrc_sentiment <- sentiment(get_sentences(article_sample$snippet), polarity_dt = hash_sentiment_nrc,
+                           valence_shifters_dt = lexicon::hash_valence_shifters)
+
+# compute sentiment scores using slangsd lexicon
+slangsd_sentiment <- sentiment(get_sentences(article_sample$snippet), polarity_dt = hash_sentiment_slangsd,
+                               valence_shifters_dt = lexicon::hash_valence_shifters)
+
+# compute sentiment scores using SOCAL-Google lexicon
+socal_sentiment <- sentiment(get_sentences(article_sample$snippet), polarity_dt = hash_sentiment_socal_google,
+                             valence_shifters_dt = lexicon::hash_valence_shifters)
+
+# compute sentiment scores using hu-liu lexicon
+huliu_sentiment <- sentiment(get_sentences(article_sample$snippet), polarity_dt = hash_sentiment_huliu,
+                             valence_shifters_dt = lexicon::hash_valence_shifters)
+
+# combine sentiment scores into a single data frame
+all_sentiment <- jr_sentiment
+colnames(all_sentiment)[10] <- "JR"
+all_sentiment <- left_join(all_sentiment, nrc_sentiment)
+colnames(all_sentiment)[11] <- "NRC"
+all_sentiment <- left_join(all_sentiment, slangsd_sentiment)
+colnames(all_sentiment)[12] <- "slangsd"
+all_sentiment <- left_join(all_sentiment, socal_sentiment)
+colnames(all_sentiment)[13] <- "socal"
+all_sentiment <- left_join(all_sentiment, huliu_sentiment)
+colnames(all_sentiment)[14] <- "huliu"
+```
+
+We then "melted" the sentiment analyses in order to show all of them on one line chart, making sure to preserve all important attributes. Initially, we created a basic plot of the sentiment scores for each lexicon over time, but unfortunately it was too difficult to read due to the variation of the scores on an article-to-article basis (we have displayed the plot to show this).
+
+```{r Inspect lexica Andrew}
+# Inspect lexica
+library(reshape2)
+library(lubridate)
+
+melted_sentiment <- melt(all_sentiment, id.vars = c("articleID", "articleWordCount", "newDesk", 
+                                                    "pubDate", "snippet", "element_id", "sentence_id", 
+                                                    "word_count", "typeOfMaterial"))
+melted_sentiment$pubDate <- ymd(melted_sentiment$pubDate)
+
+# Basic plot of sentiment scores for each lexicon in each newDesk item
+melted_sentiment %>%
+    ggplot(aes(x = newDesk, y = value, color = variable)) +
+    geom_line(show.legend = TRUE) + ggtitle("Sentiment Comparison by Lexicon and Category Item") +coord_flip()     + ylab("Average Sentiment Score") + xlab("Category") + labs(color = "Lexicon")
+```
+
+We decided to choose one lexicon to use for analysis, and came to this decision by graphing sentiment comparison by lexicon, as shown below. Using this visualization, we decided to choose the JR lexicon.
+
+```{r Lexicon choice}
+# Decide which lexicon to use
+melted_sentiment %>%
+    group_by(pubDate, variable) %>%
+    summarize(value = average_downweighted_zero(value)) %>%
+    ggplot(aes(x = pubDate, y = value, color = variable)) +
+    geom_smooth(show.legend = TRUE) + ggtitle("Average Sentiment Comparison by Lexicon Over Time") +               xlab("Publication Date") + ylab("Average Sentiment Score") + labs(color = "Lexicon")
+```
+
+### News Desk Sentiment over Time
+
+**Since we have decided to use the Jockers Rinker lexicon**, we now compare sentiment based on the *newDesk* variable over time. The *newDesk* variable is a categorization of which kind of article each piece is. We now group by the article category and sort for the top 5 and bottom 5 categories with the most polairzed average sentiments. We can see that Metropolitan articles (e.g., lifestyle, urban, etc.) became more positive throughout 2017 and 2018, whereas Podcasts category became much more negative. This is very interesting when considering the political climate that much of the New York Times focused on during much of 2017 and 2018. There are several categories that do not extend the full time here, which means that we do not have data on articles in those categories over this time.
+
+```{r JR newDesk over time Alex}
+# Jockers Rinker is the best lexicon to use for this analysis. We will continue with that lexicon
+
+# Sentiment comparison by newDesk over time
+jr_sentiment_top <- jr_sentiment %>% group_by(newDesk) %>% 
+  summarize(value = average_downweighted_zero(sentiment)) %>% top_n(5, value)
+jr_sentiment_bottom <- jr_sentiment %>% group_by(newDesk) %>% 
+  summarize(value = average_downweighted_zero(sentiment)) %>% top_n(-5, value)
+jr_sentiment_top_bottom <- rbind(jr_sentiment_top, jr_sentiment_bottom)
+
+melted_sentiment %>%
+  filter(newDesk %in% jr_sentiment_top_bottom$newDesk) %>%
+  group_by(pubDate, newDesk) %>%
+  summarize(value = average_downweighted_zero(value)) %>%
+  ggplot(aes(x = pubDate, y = value, color = newDesk)) +
+  geom_line() + ggtitle("Sentiment Comparison by Category Over Time") + 
+  xlab("Date of Publication") + ylab("Average Sentiment Score") + labs(color = "Category")
+```
+
+### Differences in Sentiment between Categories
+
+Here, we ran this chunk to produce a bar chart that showed the differences in sentiment between categories. It showed that EdLife (Education Life) articles are the most positive given the nature of the content. On the contrary, "Express" and "Smarter Living were towards the side of the spectrum indicating a more negative sentiment. We believe these findings can be used as audit tool of sorts to ensure that specific desks are creating content that matches with their overall mission. For example, if "Climate" was leaning towards the negative spectrum the NYT could speak to those writers and correct their "negative-leaning" writing. We also think these findings can be used to curate content tailored to subscribers preferences. NYT could suggest more lively articles to those readers who usually have more articles in the more positive spectrum and vice versa. We decided to add a fill for color based on the number of articles that belonged to each specific category. The scale for this fill is based on the average number of articles per category, which is roughly 100. As the graph shows, the OpEd cateogry carries a large number of articles, while the EdLife category carries very few relatively. This confirms that the average sentiment scores of categories with fewer articles are based on less data.
+
+```{r Highest and lowest newDesk George}
+jr_sentiment <- jr_sentiment %>% group_by(newDesk) %>% mutate(count = n())
+
+# Highest and lowest NewDesk categories based on sentiment scores
+jr_sentiment %>%
+    group_by(newDesk, count) %>%
+    summarize(sentiment = average_downweighted_zero(sentiment)) %>%
+    ggplot(aes(reorder(newDesk, sentiment), sentiment, fill = count)) +
+    geom_col( show.legend = FALSE) + coord_flip() + ggtitle("Sentiment Comparison by Category and Count") + ylab("Average Sentiment Score") + xlab("Category") + 
+    scale_fill_gradient2(low = "red", high = "green", midpoint = 96)
+```
+
+Similar to what we did above, we ran another graph to visualizing the sentiment based on *typeOfMaterial*. Briefings had the highest median sentiment, followed by News Analysis The lowest median sentiment scores occurred in Questions, Reviews, and Blogs. This is interesting considering the very neutral scores for questions throughout our analysis thus far.
+
+```{r Type of material sentiment George}
+# Average sentiment for each type of material with over 30 occurrences
+jr_sentiment %>%
+    ggplot(aes(reorder(typeOfMaterial, -sentiment), sentiment)) +
+    ggtitle("Sentiment Comparison by Type of Material") + geom_boxplot() + xlab("Type of Material") + ylab("Average Sentiment Score")
+```
